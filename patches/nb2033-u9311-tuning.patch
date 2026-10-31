@@ -1,0 +1,188 @@
+diff --git a/libfprint/drivers/nb2033.c b/libfprint/drivers/nb2033.c
+index d8b2cc8..1f94ec5 100644
+--- a/libfprint/drivers/nb2033.c
++++ b/libfprint/drivers/nb2033.c
+@@ -62,8 +62,10 @@
+ #define NB2033_DEFAULT_TIMEOUT 1000
+ #define NB2033_CAPTURE_TIMEOUT 2000
+ #define NB2033_TRANSITION_DELAY 50
+-#define NB2033_SETTLE_DELAY 1500
++#define NB2033_SETTLE_DELAY 2500
+ #define NB2033_ROW_READY_DELAY 150
++/* Let thermal contrast build after contact before capturing */
++#define NB2033_CAPTURE_DWELL 600
+ 
+ /* SSM states.
+  * nb2033_write_ignore_read() sends a command, then reads and discards the
+@@ -123,6 +125,9 @@ struct _FpiDeviceNb2033
+   guint8       *scanline_buf;
+   gboolean      deactivating;
+   guint         partial_received;
++  /* Blank or low-contrast frames are rejected and retaken while the finger
++   * stays on the platen; this counts the retakes for the current press. */
++  guint         poor_frame_retries;
+ };
+ 
+ G_DECLARE_FINAL_TYPE (FpiDeviceNb2033, fpi_device_nb2033, FPI, DEVICE_NB2033, FpImageDevice);
+@@ -165,6 +170,7 @@ nb2033_dev_activate (FpImageDevice *dev)
+   FpiDeviceNb2033 *self = FPI_DEVICE_NB2033 (dev);
+ 
+   self->deactivating = FALSE;
++  self->poor_frame_retries = 0;
+ 
+   fpi_image_device_activate_complete (dev, NULL);
+   fp_dbg ("nb2033 activated");
+@@ -309,6 +315,86 @@ nb2033_read_capture_cb (FpiUsbTransfer *transfer, FpDevice *dev,
+                            nb2033_read_capture_cb, NULL);
+ }
+ 
++/* Preprocessing for the raw thermal frame.
++ *
++ * The sensor delivers an 8-bit grayscale frame that carries a strong
++ * per-row offset (horizontal banding) and a slowly varying illumination
++ * across the platen. Both hurt minutiae extraction far more than the
++ * matching threshold does, so flatten the frame before it reaches
++ * bozorth3: remove each row's mean, then subtract a box-blurred copy of
++ * the image to normalize local contrast and stretch the remainder.
++ */
++static void
++nb2033_enhance_frame (guint8 *data, int w, int h)
++{
++  /* Radius must span several ridge periods (~10 px each at 20 px/mm);
++   * a window near one period erases the ridges it is meant to keep. */
++  const int radius = 40;
++  gint64 *integral;
++  gint64 total = 0;
++  double mean;
++  int x, y;
++
++  /* Pass 1: per-row mean removal (kills horizontal banding). */
++  for (y = 0; y < h; y++)
++    {
++      guint8 *row = data + y * w;
++      int sum = 0;
++
++      for (x = 0; x < w; x++)
++        sum += row[x];
++      mean = (double) sum / w;
++
++      for (x = 0; x < w; x++)
++        {
++          int v = (int) (row[x] - mean + 128.0);
++          row[x] = CLAMP (v, 0, 255);
++        }
++    }
++
++  /* Pass 2: box blur via a summed-area table (w+1 by h+1). */
++  integral = g_new0 (gint64, (gsize) (w + 1) * (h + 1));
++
++  for (y = 0; y < h; y++)
++    {
++      gint64 rowsum = 0;
++
++      for (x = 0; x < w; x++)
++        {
++          rowsum += data[y * w + x];
++          integral[(y + 1) * (w + 1) + (x + 1)] =
++            rowsum + integral[y * (w + 1) + (x + 1)];
++        }
++    }
++
++  /* Pass 3: subtract the local background, then stretch what is left. */
++  total = integral[h * (w + 1) + w];
++  mean = (double) total / ((double) w * h);
++
++  for (y = 0; y < h; y++)
++    {
++      int y0 = MAX (0, y - radius);
++      int y1 = MIN (h, y + radius + 1);
++
++      for (x = 0; x < w; x++)
++        {
++          int x0 = MAX (0, x - radius);
++          int x1 = MIN (w, x + radius + 1);
++          gint64 sum = integral[y1 * (w + 1) + x1]
++                       - integral[y0 * (w + 1) + x1]
++                       - integral[y1 * (w + 1) + x0]
++                       + integral[y0 * (w + 1) + x0];
++          double area = (double) (y1 - y0) * (x1 - x0);
++          double local = (double) sum / area;
++          double v = 128.0 + ((double) data[y * w + x] - local) * 2.0 + (mean - 128.0) * 0.0;
++
++          data[y * w + x] = CLAMP ((int) v, 0, 255);
++        }
++    }
++
++  g_free (integral);
++}
++
+ static gboolean
+ submit_image (FpiSsm        *ssm,
+               FpImageDevice *dev)
+@@ -316,11 +402,44 @@ submit_image (FpiSsm        *ssm,
+   FpiDeviceNb2033 *self = FPI_DEVICE_NB2033 (dev);
+   FpImage *img;
+ 
++
++
+   img = fp_image_new (FRAME_WIDTH, FRAME_HEIGHT);
+   if (img == NULL)
+     return FALSE;
+ 
+   memcpy (img->data, self->scanline_buf, FRAME_WIDTH * FRAME_HEIGHT);
++  /* NBIS minutiae extraction is scale-parameterised: without a real ppmm the
++   * ridge-spacing expectations fall back to nonsense and quality drops
++   * erratically. The platen is 508 dpi, i.e. 20 px/mm. */
++  img->ppmm = 20.0;
++  nb2033_enhance_frame (img->data, FRAME_WIDTH, FRAME_HEIGHT);
++
++  /* Reject a frame that carries no ridge structure at all: a thermal sensor
++   * reads almost flat when the finger only grazed the platen. Retake in the
++   * same press rather than handing bozorth3 a frame that cannot match. */
++  {
++    double sum = 0.0, sumsq = 0.0, mean, variance;
++    gsize i, n = (gsize) FRAME_WIDTH * FRAME_HEIGHT;
++
++    for (i = 0; i < n; i++)
++      {
++        sum += img->data[i];
++        sumsq += (double) img->data[i] * img->data[i];
++      }
++    mean = sum / n;
++    variance = sumsq / n - mean * mean;
++
++    if (variance < 90.0 && self->poor_frame_retries < 3)
++      {
++        fp_dbg ("frame too flat (variance %.0f), retaking", variance);
++        self->poor_frame_retries++;
++        g_object_unref (img);
++        return FALSE;
++      }
++  }
++
++  self->poor_frame_retries = 0;
+   fpi_image_device_image_captured (dev, img);
+ 
+   return TRUE;
+@@ -466,7 +585,11 @@ m_loop_state (FpiSsm *ssm, FpDevice *_dev)
+       break;
+ 
+     case M_PRECAPTURE_DONE:
+-      fpi_ssm_next_state (ssm);
++      /* Dwell before capturing: this is a thermal sensor, so ridge contrast
++       * keeps building for a moment after contact. Capturing the instant the
++       * detect level crosses the threshold yields a washed-out frame and a
++       * failed match; a short settle makes verify reliable. */
++      fpi_ssm_next_state_delayed (ssm, NB2033_CAPTURE_DWELL);
+       break;
+ 
+     case M_CAPTURE:
+@@ -556,7 +679,7 @@ fpi_device_nb2033_class_init (FpiDeviceNb2033Class *klass)
+   img_class->img_height = FRAME_HEIGHT;
+   img_class->img_width = FRAME_WIDTH;
+ 
+-  img_class->bz3_threshold = 40;
++  img_class->bz3_threshold = 22;
+ 
+   img_class->img_open = nb2033_dev_init;
+   img_class->img_close = nb2033_dev_deinit;

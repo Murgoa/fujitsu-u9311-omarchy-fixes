@@ -1,8 +1,41 @@
-# Fujitsu LIFEBOOK U9311 — eDP black screen after lid-open (Linux / Arch / Omarchy)
+# Fujitsu LIFEBOOK U9311 on Linux / Arch / Omarchy — fixes & field notes
 
 [![Platform](https://img.shields.io/badge/platform-Arch%20%7C%20Omarchy-informational)](https://archlinux.org)
 [![Kernel](https://img.shields.io/badge/kernel-6.x%20%2F%207.x-informational)](#)
 [![Status](https://img.shields.io/badge/status-fixed-success)](#)
+[![中文](https://img.shields.io/badge/lang-中文-red)](README.zh-CN.md)
+
+Hardware-level fixes for a Fujitsu LIFEBOOK **U9311** running Arch / Omarchy.
+Everything here was found, applied and verified on one real machine — not
+copied from a wiki. Each fix documents the root cause, the dead ends that
+wasted time, and the way to verify it actually worked.
+
+## What's in this repository
+
+| # | Problem | Root cause | Write-up |
+|---|---|---|---|
+| 1 | **Backlight on, panel black after lid-open / resume** — needs a reboot | BIOS ACPI table `IgfxSsdt` powers down the eDP VDD rail behind i915's back, desynchronising Panel Power Sequencing | [below](#fix-1--edp-panel-black-after-resume) + [docs/technical-analysis.md](docs/technical-analysis.md) |
+| 2 | **Fingerprint reader not detected at all** (`298d:2033` NEXT Biometrics NB-2033-U) | The driver exists only as an open libfprint merge request, and Arch ships a pinned `libfprint-git` that does not contain it | [docs/fingerprint-nb2033u.md](docs/fingerprint-nb2033u.md) |
+| 3 | **Lock screen goes black right after a failed fingerprint attempt** | Omarchy's session lock blanks the panel 5 s after arming, while a fingerprint verification is still in flight | [docs/fingerprint-nb2033u.md § Lock screen](docs/fingerprint-nb2033u.md#9-the-lock-screen-blanks-while-you-are-still-touching-the-reader) |
+
+Recommended reading order is by symptom, not by number: fix 1 is a boot-time
+firmware patch, fixes 2–3 are a userspace stack (driver → fprintd → PAM → lock UI).
+
+## Repo layout
+
+```
+acpi/                          reference AML/DSL for the eDP fix
+patches/                       local driver patches applied on top of upstream
+scripts/u9311-rebuild-uki.sh   inject the ACPI override into an existing UKI
+scripts/u9311-fingerprint-setup.sh   build + deploy the NB-2033-U fingerprint stack
+docs/technical-analysis.md     eDP failure: full log-level analysis
+docs/fingerprint-nb2033u.md    fingerprint reader: full write-up (EN)
+docs/fingerprint-nb2033u.zh-CN.md   same, 中文
+```
+
+---
+
+## Fix 1 — eDP panel black after resume
 
 Fix for the **backlight on, screen black** issue on Fujitsu LIFEBOOK U9311 (and related
 Tiger Lake Fujitsu laptops) after resuming from suspend.
@@ -16,7 +49,7 @@ which desynchronises i915's Panel Power Sequencing state.**
 
 ---
 
-## Table of contents
+### Table of contents
 
 - [Symptoms](#symptoms)
 - [Is this your bug?](#is-this-your-bug)
@@ -31,7 +64,7 @@ which desynchronises i915's Panel Power Sequencing state.**
 
 ---
 
-## Symptoms
+### Symptoms
 
 After closing the lid (suspend) and opening it again:
 
@@ -46,7 +79,7 @@ In other words: the compositor renders fine, but the picture never reaches the p
 
 The only way back is a reboot.
 
-## Is this your bug?
+### Is this your bug?
 
 Run this **after reproducing the black screen** (the machine must still be reachable over SSH):
 
@@ -76,7 +109,7 @@ The same ArchWiki patch is documented for U9312 and E5411 series.
 (the panel is simply left DPMS-off after resume). Check `hyprctl monitors` first — if it says
 `dpmsStatus: 0`, that is a different, much simpler problem.
 
-## Root cause
+### Root cause
 
 The BIOS-provided SSDT named `IgfxSsdt` (OEM ID `INTEL`, OEM Table ID `IgfxSsdt`,
 OEM Revision `0x00003000`) contains, in `_DOD` and one other method, inside
@@ -115,7 +148,7 @@ i915 ... [drm] drm_WARN_ON(intel_dp->pps.vdd_wakeref)
 > The precise reason why the VDD rail state desynchronises *link training* specifically is not
 > fully explained. What *is* reproducible: removing the two ASL blocks removes all three symptoms.
 
-## Before you start: what does NOT work
+### Before you start: what does NOT work
 
 Save yourself the time. All of the following were tested on real hardware and did **not** help:
 
@@ -130,9 +163,9 @@ Save yourself the time. All of the following were tested on real hardware and di
 | `hibernate` (S4) | **Does work** (S4 restores from a disk image and re-initialises i915 from scratch), but a ~2 minute resume is not acceptable for daily use. |
 | Just raising the ACPI OEM revision without changing AML | Starts fine, still black on resume. This is the crucial control experiment — see [docs/technical-analysis.md](docs/technical-analysis.md). |
 
-## The fix
+### The fix
 
-### Step 1 — Identify and verify the table
+#### Step 1 — Identify and verify the table
 
 ```bash
 sudo sh -c 'for f in /sys/firmware/acpi/tables/SSDT*; do
@@ -159,7 +192,7 @@ grep -c "PDRD () == Zero"    IgfxSsdt-original.dsl        # must be >= 2
 **If any of these do not match, stop.** This patch is table-specific. Do not "adapt" it by
 similarity — a wrong ACPI table can prevent the machine from booting.
 
-### Step 2 — Patch and compile
+#### Step 2 — Patch and compile
 
 Edit a **copy** of the `.dsl`:
 
@@ -180,7 +213,7 @@ revision is `0x00003001`, and the rest of the table is untouched.
 (taken from a U9311 with BIOS-provided table revision `0x3000`). **Do not ship someone else's
 AML — always rebuild from your own dump**, even if the diff looks identical.
 
-### Step 3 — Put the AML into the initramfs
+#### Step 3 — Put the AML into the initramfs
 
 The kernel reads ACPI overrides from `kernel/firmware/acpi/*.aml` inside the **early,
 uncompressed** part of the initramfs.
@@ -202,7 +235,7 @@ Take your existing production UKI, insert one CPIO entry into its initrd, and re
 Read [Pitfalls](#pitfalls-read-this-before-building-anything) first — naive approaches here
 produce an unbootable image.
 
-### Step 4 — Boot and confirm the override actually loaded
+#### Step 4 — Boot and confirm the override actually loaded
 
 ```bash
 sudo journalctl -b -k | grep -iE "Table Upgrade|IgfxSsdt"
@@ -218,7 +251,7 @@ ACPI: SSDT ... (v02 INTEL  IgfxSsdt 00003001 ...)
 
 **"The AML is in the initramfs" is not proof.** Only the `Table Upgrade: override` line is.
 
-## Verification
+### Verification
 
 ```bash
 # before suspending, note the counters
@@ -234,7 +267,7 @@ The counter must stay at **0** after several suspend/resume cycles, including a 
 (10+ minutes). Test with the lid as well as with an explicit `systemctl suspend`, since
 lid-triggered suspend usually has a debounce delay.
 
-## Automating the fix for kernel updates
+### Automating the fix for kernel updates
 
 If you used **Option A** (mkinitcpio hook), the fix survives kernel updates automatically.
 
@@ -255,11 +288,11 @@ Always check afterwards that the patched UKI really uses the **new** kernel:
 objcopy -O binary --only-section=.uname /boot/EFI/Linux/<patched>.efi /dev/stdout
 ```
 
-## Pitfalls (read this before building anything)
+### Pitfalls (read this before building anything)
 
 Each of these cost hours and produced misleading "the patch doesn't work" conclusions.
 
-### 1. The early CPIO is ~20 MB, not ~114 KB
+#### 1. The early CPIO is ~20 MB, not ~114 KB
 
 A typical U9311 initrd looks like this:
 
@@ -281,7 +314,7 @@ Kernel panic - not syncing: Unable to mount root fs on unknown-block(0,0)
 **Parse the CPIO properly** (remember 4-byte alignment on both name and data) until you hit
 `TRAILER!!!`; the first non-zero byte after it is the start of the compressed main image.
 
-### 2. `objcopy --update-section` may silently truncate
+#### 2. `objcopy --update-section` may silently truncate
 
 ```bash
 objcopy --update-section .initrd=new.initrd in.efi out.efi   # dangerous
@@ -298,7 +331,7 @@ objcopy -O binary --only-section=.initrd out.efi check.initrd
 cmp check.initrd new.initrd        # must be silent
 ```
 
-### 3. You cannot reproduce a distro's UKI with plain `mkinitcpio`
+#### 3. You cannot reproduce a distro's UKI with plain `mkinitcpio`
 
 | Build | resulting initrd |
 |---|---|
@@ -309,12 +342,12 @@ cmp check.initrd new.initrd        # must be silent
 Neither matches. Distro tooling (`limine-mkinitcpio`, `prebuilt-uki.efi` templates, extra
 drop-ins) differs from upstream defaults. Prefer modifying the existing production initrd.
 
-### 4. The AML entry must sit before `TRAILER!!!`
+#### 4. The AML entry must sit before `TRAILER!!!`
 
 Appending after the trailer is silently ignored. Use newc (magic `070701`), 110-byte header,
 name and data each padded to a multiple of 4.
 
-## Rollback
+### Rollback
 
 | Scope | How |
 |---|---|
@@ -328,7 +361,7 @@ one is a complete rollback for the ACPI change — no extra kernel installation 
 > Keeping an *older* kernel as a "rollback" is **not** equivalent: its module tree may be gone
 > after a package update.
 
-## References
+### References
 
 - ArchWiki — Fujitsu Lifebook U9311: <https://wiki.archlinux.org/title/Fujitsu_Lifebook_U9311>
 - Linux kernel — ACPI initrd table override: <https://docs.kernel.org/admin-guide/acpi/initrd_table_override.html>
@@ -336,11 +369,11 @@ one is a complete rollback for the ACPI change — no extra kernel installation 
 - Omarchy issue #12193 (logind/Hyprland suspend race)
 - Upstream ACPI patch project for U9311: <https://github.com/suikan4github/u9311-acpi-patch>
 
-## Detailed write-up
+### Detailed write-up
 
 See [docs/technical-analysis.md](docs/technical-analysis.md) for the full investigation,
 the reference experiment matrix, log excerpts, and the reasoning behind each conclusion.
 
-## License
+### License
 
 MIT — see [LICENSE](LICENSE). Use at your own risk; ACPI overrides can prevent boot.

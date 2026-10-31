@@ -1,6 +1,19 @@
-# Fujitsu LIFEBOOK U9311 合盖唤醒内屏黑屏 —— 修复方案
+# Fujitsu LIFEBOOK U9311 在 Linux / Arch / Omarchy 上的修复集
 
-> English version: [README.md](README.md) · 详细技术分析: [docs/technical-analysis.md](docs/technical-analysis.md)
+> English: [README.md](README.md) · 指纹专题（中文）: [docs/fingerprint-nb2033u.zh-CN.md](docs/fingerprint-nb2033u.zh-CN.md)
+
+这台机器上遇到的硬件级问题，一个仓库全收：每篇都写清**根因、试过但没用的死路、以及怎么验证真的修好了**。
+所有内容都在真机上实测，不是抄 wiki。
+
+| # | 问题 | 根因 | 文档 |
+|---|---|---|---|
+| 1 | **合盖/唤醒后背光亮但黑屏**，只能重启 | BIOS ACPI 表 `IgfxSsdt` 背着 i915 关断 eDP 的 VDD 电源轨，Panel Power Sequencing 状态错乱 | [下文](#fix-1--合盖唤醒后内屏黑屏) + [docs/technical-analysis.md](docs/technical-analysis.md) |
+| 2 | **指纹模块系统里完全看不到**（`298d:2033` NEXT Biometrics NB-2033-U） | 驱动只存在于未合并的 libfprint MR，而 Arch 装的是钉住的 `libfprint-git`，不含该驱动 | [docs/fingerprint-nb2033u.zh-CN.md](docs/fingerprint-nb2033u.zh-CN.md) |
+| 3 | **指纹识别失败瞬间锁屏就黑掉** | Omarchy 会话锁在锁定后 5 秒熄屏，正好卡在指纹验证过程中 | [指纹文档 §9](docs/fingerprint-nb2033u.zh-CN.md#9-锁屏在你手指还没离开时就熄屏) |
+
+---
+
+## Fix 1 — 合盖唤醒后内屏黑屏
 
 合盖挂起后开盖，**内屏背光全亮但没有画面**，系统其实还活着（SSH 能连、截图能拿到正常桌面）。
 重启才能恢复。
@@ -13,7 +26,7 @@ Panel Power Sequencing 状态错乱。** 挂起/恢复时表现为 wakeref 泄�
 
 ---
 
-## 适用判断
+### 适用判断
 
 复现黑屏后（系统仍能 SSH）：
 
@@ -41,7 +54,7 @@ sudo sh -c 'for f in /sys/firmware/acpi/tables/SSDT*; do
 > 注意：如果 `hyprctl monitors` 显示 `dpmsStatus: 0`，那是另一个更简单的问题
 > （合成器没把 DPMS 打开），不是本文说的这个。
 
-## 快速步骤
+### 快速步骤
 
 1. **找到并核对表**：必须唯一命中一个 `SSDT*`，OEM Table ID 为 `IgfxSsdt`，
    OEM Revision 为 `0x00003000`，且两处目标代码块都在 `If ((PDRD () == Zero))` 内。
@@ -60,7 +73,7 @@ sudo journalctl -b -k | grep -iE "Table Upgrade|IgfxSsdt"
 
 **AML 打进包里 ≠ 覆盖生效**，只认 `Table Upgrade: override` 这一行。
 
-## 别浪费时间的方向（都实测过，全部无效）
+### 别浪费时间的方向（都实测过，全部无效）
 
 | 尝试 | 结论 |
 |---|---|
@@ -73,7 +86,7 @@ sudo journalctl -b -k | grep -iE "Table Upgrade|IgfxSsdt"
 | `hibernate`（S4） | **确实有效**（从磁盘镜像恢复，i915 完全重新初始化），但唤醒要 2 分钟 |
 | 只改 ACPI revision 不改逻辑 | 能启动，但挂起照样黑（这是关键的对照组） |
 
-## 三个必踩的坑
+### 三个必踩的坑
 
 1. **early CPIO 约 20 MB，不是 114 KB**。某些固件文件本身就是 `.zst`，所以在 114 KB 处
    也能搜到 zstd 魔数。按它切分会把 initrd 切坏，直接
@@ -85,24 +98,24 @@ sudo journalctl -b -k | grep -iE "Table Upgrade|IgfxSsdt"
 3. **mkinitcpio 复刻不出发行版的 UKI**。默认 27 MB、`-S autodetect` 230 MB、
    生产 37 MB，都不匹配。别试图重建，直接在现有 initrd 上最小修改。
 
-## 内核更新后
+### 内核更新后
 
 - 用 mkinitcpio hook 方案：自动跟随，不用管
 - 用独立 UKI 方案：每次内核更新后跑一次 `sudo u9311-rebuild-uki.sh`
 
-## 回滚
+### 回滚
 
 同内核版本下，**未打补丁的原版 UKI 就是完整的回滚入口**（两者 `.linux` 段逐字节相同，
 只差 initrd 里一条 AML），不需要额外装一个旧内核。
 
 > 跨内核版本启动旧 UKI 不算回滚保障 —— 旧内核的模块目录可能已被包管理器清掉。
 
-## 免责声明
+### 免责声明
 
 ACPI 表覆盖写错可能导致无法开机。**必须先从自己机器 dump 表、核对结构、再编译**，
 不要直接用别人仓库里的 AML 二进制。建议先做一版"只改 revision 不改逻辑"的对照测试，
 确认你的部署链路能正常启动，再上正式补丁。
 
-## 许可
+### 许可
 
 MIT
