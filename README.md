@@ -17,9 +17,13 @@ wasted time, and the way to verify it actually worked.
 | 1 | **Backlight on, panel black after lid-open / resume** — needs a reboot | BIOS ACPI table `IgfxSsdt` powers down the eDP VDD rail behind i915's back, desynchronising Panel Power Sequencing | [below](#fix-1--edp-panel-black-after-resume) + [docs/technical-analysis.md](docs/technical-analysis.md) |
 | 2 | **Fingerprint reader not detected at all** (`298d:2033` NEXT Biometrics NB-2033-U) | The driver exists only as an open libfprint merge request, and Arch ships a pinned `libfprint-git` that does not contain it | [docs/fingerprint-nb2033u.md](docs/fingerprint-nb2033u.md) |
 | 3 | **Lock screen goes black right after a failed fingerprint attempt** | Omarchy's session lock blanks the panel 5 s after arming, while a fingerprint verification is still in flight | [docs/fingerprint-nb2033u.md § Lock screen](docs/fingerprint-nb2033u.md#9-the-lock-screen-blanks-while-you-are-still-touching-the-reader) |
+| 4 | **Concluded this machine has no IR camera** — nearly settled for visible-light face auth | One UVC device registers **four** video nodes while `lsusb` shows one; only `/dev/video2` reports `Card type: IR Camera` | [docs/face-unlock-howdy.md §1](docs/face-unlock-howdy.md#1-identifying-the-hardware-the-ir-node-lsusb-hides) |
+| 5 | **Face auth always says `Face verification timed out`**, with no logs whatsoever | howdy-next sets the compare child's `RLIMIT_CPU` to `timeout + 5 s`; the default 4 s leaves 9 s of CPU, IR inference exhausts it, `SIGXCPU` kills the process, and PAM misreports it as a timeout | [docs/face-unlock-howdy.md §4](docs/face-unlock-howdy.md#4-the-expensive-one-face-verification-timed-out-is-really-a-cpu-limit) |
+| 6 | **1Password only offers a fingerprint; face-first never takes effect** | 1Password's "system authentication" goes through polkit, not its own PAM — edit `/etc/pam.d/polkit-1` | [docs/face-unlock-howdy.md §7.4](docs/face-unlock-howdy.md#74-polkit--this-is-where-1password-lives) |
 
 Recommended reading order is by symptom, not by number: fix 1 is a boot-time
-firmware patch, fixes 2–3 are a userspace stack (driver → fprintd → PAM → lock UI).
+firmware patch; fixes 2–3 are the fingerprint userspace stack (driver → fprintd → PAM → lock UI);
+fixes 4–6 are the face-unlock stack (IR camera → howdy → PAM → polkit/lock UI).
 
 ## Repo layout
 
@@ -31,6 +35,8 @@ scripts/u9311-fingerprint-setup.sh   build + deploy the NB-2033-U fingerprint st
 docs/technical-analysis.md     eDP failure: full log-level analysis
 docs/fingerprint-nb2033u.md    fingerprint reader: full write-up (EN)
 docs/fingerprint-nb2033u.zh-CN.md   same, 中文
+docs/face-unlock-howdy.md      IR camera + face unlock: full write-up (EN)
+docs/face-unlock-howdy.zh-CN.md     same, 中文
 ```
 
 ---

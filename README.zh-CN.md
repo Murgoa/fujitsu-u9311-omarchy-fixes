@@ -1,6 +1,6 @@
 # Fujitsu LIFEBOOK U9311 在 Linux / Arch / Omarchy 上的修复集
 
-> English: [README.md](README.md) · 指纹专题（中文）: [docs/fingerprint-nb2033u.zh-CN.md](docs/fingerprint-nb2033u.zh-CN.md)
+> English: [README.md](README.md) · 指纹专题（中文）: [docs/fingerprint-nb2033u.zh-CN.md](docs/fingerprint-nb2033u.zh-CN.md) · 人脸解锁专题（中文）: [docs/face-unlock-howdy.zh-CN.md](docs/face-unlock-howdy.zh-CN.md)
 
 这台机器上遇到的硬件级问题，一个仓库全收：每篇都写清**根因、试过但没用的死路、以及怎么验证真的修好了**。
 所有内容都在真机上实测，不是抄 wiki。
@@ -10,6 +10,9 @@
 | 1 | **合盖/唤醒后背光亮但黑屏**，只能重启 | BIOS ACPI 表 `IgfxSsdt` 背着 i915 关断 eDP 的 VDD 电源轨，Panel Power Sequencing 状态错乱 | [下文](#fix-1--合盖唤醒后内屏黑屏) + [docs/technical-analysis.md](docs/technical-analysis.md) |
 | 2 | **指纹模块系统里完全看不到**（`298d:2033` NEXT Biometrics NB-2033-U） | 驱动只存在于未合并的 libfprint MR，而 Arch 装的是钉住的 `libfprint-git`，不含该驱动 | [docs/fingerprint-nb2033u.zh-CN.md](docs/fingerprint-nb2033u.zh-CN.md) |
 | 3 | **指纹识别失败瞬间锁屏就黑掉** | Omarchy 会话锁在锁定后 5 秒熄屏，正好卡在指纹验证过程中 | [指纹文档 §9](docs/fingerprint-nb2033u.zh-CN.md#9-锁屏在你手指还没离开时就熄屏) |
+| 4 | **以为这台机器没有红外摄像头**，只能上可见光人脸 | 同一个 UVC 设备注册了 4 个 video 节点，`lsusb` 只显示 1 个；`/dev/video2` 的 `Card type` 才是 `IR Camera` | [docs/face-unlock-howdy.zh-CN.md §1](docs/face-unlock-howdy.zh-CN.md#1-识别硬件那个被-lsusb-藏起来的-ir-节点) |
+| 5 | **人脸认证总是 `Face verification timed out`，且无任何日志** | howdy-next 给比对子进程的 `RLIMIT_CPU` 是 `timeout + 5s`，默认 4s 只给 9 秒 CPU，IR 推理打满后被 `SIGXCPU` 杀掉，PAM 层却报成「超时」 | [docs/face-unlock-howdy.zh-CN.md §4](docs/face-unlock-howdy.zh-CN.md#4-最坑的一个face-verification-timed-out-其实是-cpu-超限) |
+| 6 | **1Password 解锁只弹指纹，改成优先人脸无效** | 1Password 的「系统认证」走 polkit，不是它自己的 PAM；要改 `/etc/pam.d/polkit-1` | [docs/face-unlock-howdy.zh-CN.md §7.4](docs/face-unlock-howdy.zh-CN.md#74-polkit--1password-就在这里) |
 
 ---
 
