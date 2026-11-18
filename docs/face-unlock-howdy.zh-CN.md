@@ -407,22 +407,35 @@ setsid pamtester -v <service> murgo authenticate </dev/null
 
 原则一致：**`sufficient` + 密码永远兜底**。人脸失败不应该比没有这个人脸功能更糟。
 
+> **动手前先开一个 root shell**（`sudo -i`，或者另一个 TTY 里登录 root）。
+> PAM 写错了会让你既进不了 `sudo` 也登不了桌面，那时候只能靠 root shell 或 live USB 救。
+> 这不是危言耸听——本仓库的 `scripts/` 每个改动都带 `.bak.<时间戳>` 备份，就是为了这一刻。
+
 ### 7.1 `sudo`
 
-本机 `sudo` 已经配了指纹（`pam_fprintd.so`）。人脸放在它**后面**——先让热敏指纹试一次，
-超时了再走人脸，最后密码：
+本机 `sudo` 已经配了指纹（`pam_fprintd.so`）。人脸放在它**前面**，指纹退居兜底：
 
 ```bash
 # /etc/pam.d/sudo
-auth      [success=1 default=ignore] pam_exec.so quiet /usr/bin/omarchy-hw-laptop-closed
-auth      sufficient pam_fprintd.so
+auth      [success=2 default=ignore] pam_exec.so quiet /usr/bin/omarchy-hw-laptop-closed
 auth      sufficient pam_howdy.so
+auth      sufficient pam_fprintd.so
 #%PAM-1.0
 auth      include    system-auth
 account   include    system-auth
 session   include    system-auth
 session   optional   pam_systemd.so class=none
 ```
+
+**`success=1` 要改成 `success=2`。** 这行的语义是「合盖时返回成功，跳过后面 N 个模块直落密码」，
+现在前面有两个生物识别模块，N 就得是 2。写错的话合盖时只跳过一个，正好停在指纹上，
+表现成「一合盖又回去按指纹」。
+
+**人脸优先的代价要清楚：** 摄像头每次都会先开，扫描最长 `timeout`（20 秒）。坐在屏幕前是
+1.3–2 秒，没问题；但如果你锁了 `sudo` 凭据又背对屏幕去干别的，它会先等满 20 秒才轮到指纹。
+
+如果你更想「指纹优先、人脸兜底」，把这两行换回来，`success` 改回 1 即可——两种都合法，
+取决于你更常做哪个动作。本机选人脸优先是因为绝大多数 `sudo` 都发生在屏幕前。
 
 > 原文件里 `#%PAM-1.0` 在第三行，是被上游插进去的；保持原样即可，PAM 不要求它必须在首行。
 
@@ -702,7 +715,7 @@ journalctl --user --since "5 min ago" | grep -i "plugin load failed"
 本机备份：
 
 ```
-/etc/pam.d/sudo.bak.20261112224408
+/etc/pam.d/sudo.bak.20261118223550     # 改成人脸优先之前
 /etc/pam.d/sddm.bak.202611122247xx
 /etc/pam.d/polkit-1.bak.20261113004837
 ~/.config/omarchy/plugins/murgo.lock/Service.qml.bak.20261112224622

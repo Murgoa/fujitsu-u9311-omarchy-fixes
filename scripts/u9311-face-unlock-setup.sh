@@ -254,32 +254,71 @@ EOF
   log "pam[omarchy-lock-face]: created"
 }
 
-# polkit is special: its lid line skips N modules with success=N, so inserting a
-# module means incrementing N or a closed lid silently goes back to fingerprint.
-fix_polkit_success_count() {
-  local file=/etc/pam.d/polkit-1
+# The lid line skips N modules with success=N. Whenever a biometric is inserted
+# above it, N must match the number of biometrics it should skip, or a closed lid
+# silently falls through to the one it was supposed to skip.
+fix_lid_success_count() {
+  local svc=$1 file=/etc/pam.d/$1
+  [[ -f $file ]] || return 0
   grep -q 'success=[0-9].*omarchy-hw-laptop-closed' "$file" 2>/dev/null || return 0
   local n
-  n=$(grep -c '^\s*\(-\?auth\)\s\+sufficient\s\+pam_howdy\.so\|^\s*\(-\?auth\)\s\+sufficient\s\+pam_fprintd\.so' "$file")
+  n=$(grep -cE '^\s*-?auth\s+sufficient\s+pam_(howdy|fprintd)\.so' "$file")
   [[ $n -ge 1 ]] || return 0
   if grep -q "success=$n default=ignore.*omarchy-hw-laptop-closed" "$file"; then
-    log "pam[polkit-1]: success=$n already correct"
+    log "pam[$svc]: lid skip count $n already correct"
     return 0
   fi
   backup_once "$file"
-  sudo sed -i "s/success=[0-9]\( default=ignore.*omarchy-hw-laptop-closed\)/success=$n\1/" "$file"
-  log "pam[polkit-1]: lid skip count set to $n"
+  sudo sed -i "s/success=[0-9]\+\( default=ignore.*omarchy-hw-laptop-closed\)/success=$n\1/" "$file"
+  log "pam[$svc]: lid skip count set to $n"
+}
+
+# Let face win over the fingerprint reader, keeping the lid guard correct.
+#
+# The lid line skips N modules with success=N, so every biometric added in front
+# of it means N increments. Get this wrong and a closed lid silently goes back to
+# waiting for a fingerprint — which looks like "the lid broke my settings".
+ensure_face_first() {
+  local svc=$1 file=/etc/pam.d/$1
+  [[ -f $file ]] || return 0
+  grep -q pam_howdy "$file" || return 0
+  grep -q pam_fprintd "$file" || return 0
+
+  local h f
+  h=$(grep -n 'sufficient\s\+pam_howdy\.so' "$file" | head -1 | cut -d: -f1)
+  f=$(grep -n 'sufficient\s\+pam_fprintd\.so' "$file" | head -1 | cut -d: -f1)
+  [[ -n $h && -n $f ]] || return 0
+
+  if [[ $h -gt $f ]]; then
+    backup_once "$file"
+    # Swap the two lines, leaving everything else untouched.
+    sudo awk '
+      { n++; L[n] = $0
+        if ($0 ~ /sufficient[ \t]+pam_howdy\.so/   && !h) h = n
+        if ($0 ~ /sufficient[ \t]+pam_fprintd\.so/ && !f) f = n }
+      END { if (h && f && f < h) { t = L[h]; L[h] = L[f]; L[f] = t }
+            for (i = 1; i <= n; i++) print L[i] }
+    ' "$file" | sudo tee "$file.new" >/dev/null
+    sudo mv "$file.new" "$file"
+    log "pam[$svc]: moved pam_howdy ahead of pam_fprintd"
+  else
+    log "pam[$svc]: already face-first"
+  fi
+  fix_lid_success_count "$svc"
 }
 
 wire_all_pam() {
-  # sudo: face AFTER fingerprint — let the thermal sensor try once first.
+  # sudo and polkit both insert face ahead of the fingerprint reader; the lid
+  # guard above them is re-counted afterwards by ensure_face_first().
   if [[ -f /etc/pam.d/sudo ]] && ! grep -q pam_howdy /etc/pam.d/sudo; then
     backup_once /etc/pam.d/sudo
     if grep -q pam_fprintd /etc/pam.d/sudo; then
-      sudo awk '{print} /pam_fprintd\.so/ && !done {print "auth      sufficient pam_howdy.so"; done=1}' \
+      # Insert ABOVE the fingerprint line, not below it: face is the preferred path.
+      sudo awk '{ if (!done && $0 ~ /sufficient[ \t]+pam_fprintd\.so/) {
+                    print "auth      sufficient pam_howdy.so"; done = 1 } print }' \
         /etc/pam.d/sudo | sudo tee /etc/pam.d/sudo.new >/dev/null
       sudo mv /etc/pam.d/sudo.new /etc/pam.d/sudo
-      log "pam[sudo]: inserted after pam_fprintd"
+      log "pam[sudo]: inserted pam_howdy before pam_fprintd"
     else
       wire_pam sudo '^\s*-?auth\s.*include'
     fi
@@ -288,7 +327,12 @@ wire_all_pam() {
   wire_pam polkit-1 '^\s*-?auth\s.*include'
   wire_pam sddm '^\s*-?auth\s.*include'
   wire_pam_dedicated
-  fix_polkit_success_count
+
+  # Normalise every service that carries both biometrics.
+  local svc
+  for svc in sudo polkit-1; do
+    ensure_face_first "$svc"
+  done
 }
 
 # ---------------------------------------------------------------- main

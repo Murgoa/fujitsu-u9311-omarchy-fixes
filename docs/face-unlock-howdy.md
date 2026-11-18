@@ -422,22 +422,40 @@ setsid pamtester -v <service> murgo authenticate </dev/null
 The rule is the same everywhere: **`sufficient`, with the password always as a fallback.** A face
 miss must never leave you worse off than not having face unlock at all.
 
+> **Open a root shell before you touch any of this** (`sudo -i`, or log in as root on another TTY).
+> A broken PAM stack leaves you unable to `sudo` *and* unable to log into the desktop, and only a
+> root shell or a live USB gets you back. This is not hypothetical — every change in `scripts/`
+> keeps a `.bak.<timestamp>` for exactly that moment.
+
 ### 7.1 `sudo`
 
-This machine already has fingerprint on `sudo` (`pam_fprintd.so`). Face goes **after** it — let the
-thermal sensor try once, then face, then password:
+This machine already has fingerprint on `sudo` (`pam_fprintd.so`). Face goes **first**, with the
+fingerprint demoted to a fallback:
 
 ```bash
 # /etc/pam.d/sudo
-auth      [success=1 default=ignore] pam_exec.so quiet /usr/bin/omarchy-hw-laptop-closed
-auth      sufficient pam_fprintd.so
+auth      [success=2 default=ignore] pam_exec.so quiet /usr/bin/omarchy-hw-laptop-closed
 auth      sufficient pam_howdy.so
+auth      sufficient pam_fprintd.so
 #%PAM-1.0
 auth      include    system-auth
 account   include    system-auth
 session   include    system-auth
 session   optional   pam_systemd.so class=none
 ```
+
+**`success=1` must become `success=2`.** That line means "when the lid is closed, return success and
+skip the next N modules, falling straight to password". There are now two biometric modules above
+it, so N is 2. Get it wrong and a closed lid skips only one, landing on the fingerprint line —
+which reads as "closing the lid brought the fingerprint back".
+
+**Know what face-first costs:** the camera opens on every invocation and a scan may run for the
+full `timeout` (20 s). Sitting in front of the screen that is 1.3–2 s and fine; but if you step away
+right after `sudo -k`, it will spend the full 20 s before falling through to the fingerprint reader.
+
+If you would rather have "fingerprint first, face as backup", swap the two lines and put `success`
+back to 1 — both are legitimate. This machine chose face-first because almost every `sudo` happens
+in front of the screen.
 
 > The stock file has `#%PAM-1.0` on line 3 because something prepended to it. Leave it — PAM does
 > not require it to be the first line.
@@ -724,7 +742,7 @@ journalctl --user --since "5 min ago" | grep -i "plugin load failed"
 Backups on this machine:
 
 ```
-/etc/pam.d/sudo.bak.20261112224408
+/etc/pam.d/sudo.bak.20261118223550     # before switching to face-first
 /etc/pam.d/sddm.bak.202611122247xx
 /etc/pam.d/polkit-1.bak.20261113004837
 ~/.config/omarchy/plugins/murgo.lock/Service.qml.bak.20261112224622
