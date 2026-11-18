@@ -11,10 +11,16 @@
 #
 #   ./u9311-face-unlock-setup.sh             # detect + install + configure + PAM
 #   ./u9311-face-unlock-setup.sh --check     # only report current state
+#   ./u9311-face-unlock-setup.sh --pin       # fix after a reboot: re-point + arm the pin service
 #   ./u9311-face-unlock-setup.sh --pam-only  # skip install/config, just redo PAM
 #   ./u9311-face-unlock-setup.sh --enroll    # also run `howdy add` (interactive)
 #
 # Requires: sudo, yay (AUR). See docs/face-unlock-howdy.md for the why.
+#
+# NOTE ON PATHS: do not hard-code any camera path here, not even a by-id one.
+# This camera exposes two sensors that both report sysfs index=0, so
+# `...-video-index0` silently re-points at the colour node after a reboot.
+# Everything is derived from sysfs name+index and re-pinned by a systemd unit.
 #
 set -euo pipefail
 
@@ -39,43 +45,61 @@ prime_sudo() {
 
 # The whole point of this script: `lsusb` shows one camera, UVC registers four
 # nodes, and only some of them are IR. Ask each node what it is.
+#
+# Match on sysfs `name` + `index` rather than on a device number. index==0 is the
+# capture node; index==1 on the same sensor is metadata.
 find_ir_node() {
-  local d card
-  for d in /dev/video*; do
-    [[ -e $d ]] || continue
-    card=$(v4l2-ctl -d "$d" --info 2>/dev/null | sed -n 's/.*Card type *: *//p' || true)
-    [[ $card == *"IR Camera"* ]] && { echo "$d"; return 0; }
+  local d name idx
+  for d in /sys/class/video4linux/video*; do
+    [[ -e $d/name ]] || continue
+    name=$(cat "$d/name" 2>/dev/null) || continue
+    idx=$(cat "$d/index" 2>/dev/null) || continue
+    [[ $name == *"IR Camera"* && $idx == 0 ]] && { echo "/dev/$(basename "$d")"; return 0; }
   done
   return 1
 }
 
-# /dev/videoN moves between boots; by-id does not.
-stable_path_for() {
-  local target
-  target=$(readlink -f "$1")
-  local link
-  for link in /dev/v4l/by-id/*; do
-    [[ -e $link ]] || continue
-    [[ $(readlink -f "$link") == "$target" ]] && { echo "$link"; return 0; }
+# BELOW IS THE TRAP THIS REPO ALREADY FELL INTO ONCE:
+#
+# `/dev/v4l/by-id/...-video-indexN` looks stable and is not. The N in that name
+# is the value of sysfs `index`, not the device number — and this camera has TWO
+# sensors (colour and IR) that both report index=0. So `...-video-index0` points
+# at whichever one udev happened to enumerate first, and after a reboot it moved
+# from video2 (IR) to video0 (colour). howdy then failed with "cannot open
+# configured camera", and had it opened, face auth would have been running on a
+# photo-forgeable colour stream.
+#
+# The only reliable identification is name+index, which is why the node is
+# re-pinned at boot instead of being hard-coded to any path.
+describe_node() {
+  local d
+  for d in /sys/class/video4linux/video*; do
+    printf '     %-10s name=%-24s index=%s\n' \
+      "$(basename "$d")" "$(cat "$d/name" 2>/dev/null)" "$(cat "$d/index" 2>/dev/null)"
   done
-  return 1
 }
 
 report_state() {
-  local ir stable
+  local ir pinned
   prime_sudo
+  describe_node
   ir=$(find_ir_node || true)
   if [[ -n $ir ]]; then
-    stable=$(stable_path_for "$ir" || echo "(no by-id link)")
-    log "IR camera     : $ir  →  $stable"
+    log "IR camera     : $ir  (name+index match)"
   else
     warn "IR camera     : NOT FOUND — this machine may really have colour only"
   fi
 
   log "howdy installed: $(command -v howdy >/dev/null 2>&1 && howdy version 2>/dev/null || echo no)"
-  log "device_path    : $(sudo grep -o 'device_path = .*' "$HOWDY_CONF" 2>/dev/null | cut -d= -f2- | xargs || echo '(no config)')"
-  log "timeout        : $(sudo grep -o '^timeout = .*' "$HOWDY_CONF" 2>/dev/null | cut -d= -f2 | xargs || echo '-')"
+  pinned=$(sudo sed -n 's/^device_path = //p' "$HOWDY_CONF" 2>/dev/null || true)
+  log "device_path    : ${pinned:-(no config)}"
+  if [[ -n $ir && -n $pinned && $pinned != "$ir" ]]; then
+    warn "  ^^ MISMATCH: config points somewhere other than the IR capture node."
+    warn "     This is the reboot bug — run install/--pin to fix it."
+  fi
+  log "timeout        : $(sudo sed -n 's/^timeout = //p' "$HOWDY_CONF" 2>/dev/null || echo '-')"
   log "models         : $(sudo howdy list 2>/dev/null | grep -c . || echo 0)"
+  log "pin service    : $(systemctl is-enabled u9311-ir-camera-pin.service 2>/dev/null || echo 'not installed')"
 
   local svc
   for svc in "${PAM_HOWDY_SERVICES[@]}"; do
@@ -110,13 +134,13 @@ install_howdy() {
 }
 
 configure_howdy() {
-  local ir stable
+  local ir
   ir=$(find_ir_node) || die "no IR camera node found — refusing to configure a colour camera"
-  stable=$(stable_path_for "$ir" || echo "$ir")
-  [[ $stable == /dev/v4l/by-id/* ]] || warn "no by-id link for $ir; writing the unstable path"
 
-  log "configuring device_path = $stable"
-  sudo howdy set device_path "$stable"
+  # Write the current /dev/videoN, not a by-id path: see describe_node() for why
+  # by-id is a lie on this hardware. install_pin_service() keeps it correct.
+  log "configuring device_path = $ir"
+  sudo howdy set device_path "$ir"
   sudo howdy set frame_width 640
   sudo howdy set frame_height 360
   sudo howdy set max_height 320
@@ -129,6 +153,69 @@ configure_howdy() {
   sudo howdy set yunet_score_threshold 0.6
   sudo howdy set clahe_enabled true
   sudo howdy set end_report false
+}
+
+# ---------------------------------------------------------------- pin service
+#
+# `/dev/videoN` is not stable either, so nothing can be hard-coded. Re-derive the
+# IR capture node from sysfs at boot and on every camera re-enumeration, and point
+# howdy at whatever number it got this time.
+install_pin_service() {
+  local pin=/usr/local/bin/u9311-ir-camera-pin
+  local unit=/etc/systemd/system/u9311-ir-camera-pin.service
+  local rule=/etc/udev/rules.d/70-u9311-ir-camera-pin.rules
+
+  sudo tee "$pin" >/dev/null <<'PINEOF'
+#!/usr/bin/env bash
+# u9311-ir-camera-pin — point howdy at the current IR capture node.
+set -euo pipefail
+
+CONF=/etc/howdy/config.ini
+[[ -f $CONF ]] || exit 0
+command -v howdy >/dev/null 2>&1 || exit 0
+
+ir=""
+for d in /sys/class/video4linux/video*; do
+  [[ -e $d/name ]] || continue
+  [[ $(cat "$d/name" 2>/dev/null) == *"IR Camera"* ]] || continue
+  [[ $(cat "$d/index" 2>/dev/null) == 0 ]] || continue
+  ir="/dev/$(basename "$d")"
+  break
+done
+
+[[ -n $ir ]] || { echo "u9311-ir-camera-pin: no IR capture node" >&2; exit 0; }
+
+cur=$(sed -n 's/^device_path = //p' "$CONF")
+[[ $cur == "$ir" ]] && exit 0
+
+howdy set device_path "$ir" >/dev/null
+echo "u9311-ir-camera-pin: device_path $cur -> $ir" | systemd-cat -t u9311-ir-camera-pin
+PINEOF
+  sudo chmod 755 "$pin"
+
+  sudo tee "$unit" >/dev/null <<'UNITEOF'
+[Unit]
+Description=Pin howdy's camera to the current IR capture node
+After=systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/u9311-ir-camera-pin
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+UNITEOF
+
+  sudo tee "$rule" >/dev/null <<'RULEEOF'
+ACTION=="add", SUBSYSTEM=="video4linux", ATTR{name}=="*IR Camera*", TAG+="systemd", ENV{SYSTEMD_WANTS}+="u9311-ir-camera-pin.service"
+RULEEOF
+
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now u9311-ir-camera-pin.service
+  sudo udevadm control --reload-rules
+  log "pin service installed and enabled"
 }
 
 # ---------------------------------------------------------------- PAM
@@ -208,9 +295,11 @@ wire_all_pam() {
 
 case "${1:---all}" in
   --check)    report_state; exit 0 ;;
+  # The reboot fix: no reinstall, no re-enrol, just re-point and arm the service.
+  --pin)      configure_howdy; install_pin_service; report_state; exit 0 ;;
   --pam-only) wire_all_pam; report_state; exit 0 ;;
-  --enroll)   install_howdy; configure_howdy; sudo howdy add --plain -y; report_state; exit 0 ;;
-  --all|"")   install_howdy; configure_howdy; wire_all_pam; report_state ;;
+  --enroll)   install_howdy; configure_howdy; install_pin_service; sudo howdy add --plain -y; report_state; exit 0 ;;
+  --all|"")   install_howdy; configure_howdy; install_pin_service; wire_all_pam; report_state ;;
   *)          die "unknown option: $1" ;;
 esac
 

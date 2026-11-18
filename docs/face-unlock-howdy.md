@@ -34,6 +34,11 @@ machine, and the approaches that failed are included. Those are the expensive pa
    `/usr/lib/howdy/howdy-compare <user>` directly.
 6. **1Password's verification goes through polkit, not its own PAM.** To make 1Password prefer
    your face, edit `/etc/pam.d/polkit-1`. Nothing in 1Password's settings will help.
+7. **`/dev/v4l/by-id/...-video-index0` is not a stable path.** The `indexN` in that name is the
+   sysfs `index` value, not a node number, and this camera's colour and IR sensors both report
+   `index=0` — so after a reboot the link moves from the IR node to the colour node and face auth
+   dies with `cannot open configured camera`. **This bit me in production.** Identify by sysfs
+   `name` + `index` and re-pin at boot (§1).
 
 ---
 
@@ -89,9 +94,13 @@ can pass. An IR image only shows reflectance under active illumination, and a ph
 black in that band. This is exactly why Windows Hello uses IR, and it is the only correct choice
 here.
 
-### Use a stable path, not `/dev/videoN`
+### Do not use `by-id`, and do not hard-code `/dev/videoN`
 
-Node numbering shifts with enumeration order. Use `by-id`:
+This section is the single most important correction in this write-up. The first revision of this
+document recommended `/dev/v4l/by-id/`. That was wrong, and wrong in a way that hides: it works
+right up until some reboot.
+
+The links look like this:
 
 ```bash
 $ ls -la /dev/v4l/by-id/
@@ -99,18 +108,69 @@ usb-SunplusIT_Inc_FJ_Camera_01.00.00-video-index0 -> ../../video2
 usb-SunplusIT_Inc_FJ_Camera_01.00.00-video-index1 -> ../../video3
 ```
 
-Note the vendor string is **SunplusIT** while `lsusb` reports Chicony — both are correct. One comes
-from the USB descriptor's `iManufacturer`, the other from the `idVendor` vendor database.
-
-Confirm where `index0` actually points:
+`index0` reads as "the zeroth capture node", stable and reliable. **But the `indexN` in that name is
+not a node number — it is the value of the sysfs `index` file:**
 
 ```bash
-$ v4l2-ctl -d /dev/v4l/by-id/usb-SunplusIT_Inc_FJ_Camera_01.00.00-video-index0 --info | grep 'Card type'
-    Card type        : FJ Camera: IR Camera
+$ for f in /sys/class/video4linux/video*/index; do echo "$f = $(cat $f)"; done
+/sys/class/video4linux/video0/index = 0     # colour capture
+/sys/class/video4linux/video1/index = 1     # colour metadata
+/sys/class/video4linux/video2/index = 0     # IR capture     ← collides with video0
+/sys/class/video4linux/video3/index = 1     # IR metadata
 ```
 
-(On this machine `index0` → `video2` is IR and `index1` → `video3` is the metadata node.
-**Other machines may differ — check yours.**)
+**This camera has two sensors — colour and IR — and both report `index=0`.** So which node
+`...-video-index0` points at is decided by enumeration order. Measured here:
+
+| | `...-video-index0` points at | Result |
+|---|---|---|
+| day of setup | `video2` (IR) | fine, 8/8 |
+| **after one reboot** | **`video0` (colour)** | `Failed to open camera device` |
+
+Face unlock died on the first reboot, with this in the log:
+
+```
+pam_howdy(sudo:auth): Face verification failed: cannot open configured camera
+```
+
+The worse case is silent: had the colour node opened, face auth would have **quietly switched to the
+colour camera** — apparently working, but no longer IR, which was the entire reason for choosing it.
+
+### The right way: identify by sysfs name + index, and re-derive it at boot
+
+```bash
+for d in /sys/class/video4linux/video*; do
+  [[ $(cat "$d/name") == *"IR Camera"* && $(cat "$d/index") == 0 ]] \
+    && echo "/dev/$(basename "$d")"
+done
+# → /dev/video2
+```
+
+`name` is the string the driver reports and `index` separates capture from metadata; together they
+are unique and do not move with enumeration order. The **number** in `/dev/videoN` still moves, so it
+must not be hard-coded either — it gets rewritten at boot.
+`scripts/u9311-face-unlock-setup.sh --pin` installs a systemd oneshot plus a udev rule to do exactly
+that:
+
+```bash
+# the core of it, installed as /usr/local/bin/u9311-ir-camera-pin
+ir=""
+for d in /sys/class/video4linux/video*; do
+  [[ $(cat "$d/name") == *"IR Camera"* ]] || continue
+  [[ $(cat "$d/index") == 0 ]] || continue
+  ir="/dev/$(basename "$d")"; break
+done
+[[ $(sed -n 's/^device_path = //p' /etc/howdy/config.ini) == "$ir" ]] || howdy set device_path "$ir"
+```
+
+The udev rule also fires on resume / re-enumeration:
+
+```
+ACTION=="add", SUBSYSTEM=="video4linux", ATTR{name}=="*IR Camera*", TAG+="systemd", ENV{SYSTEMD_WANTS}+="u9311-ir-camera-pin.service"
+```
+
+> Aside: the vendor string is **SunplusIT** while `lsusb` reports Chicony — both are correct. One
+> comes from the USB descriptor's `iManufacturer`, the other from the `idVendor` vendor database.
 
 ---
 
@@ -166,7 +226,7 @@ abort_if_lid_closed = false    # must still unlock when docked with the lid shut
 disabled = false
 
 [video]
-device_path = /dev/v4l/by-id/usb-SunplusIT_Inc_FJ_Camera_01.00.00-video-index0
+device_path = /dev/video2        # re-pinned at boot; never hard-code this — see §1
 timeout = 20                   # ← critical, see §4
 max_height = 320               # downscale for speed; 320 is plenty for YuNet
 frame_width = 640
@@ -581,11 +641,13 @@ Also: QML changes require `omarchy-restart-shell`. Saving the file is not enough
 | `Face verification timed out`, no output | **Killed by `SIGXCPU`** (exit 152) | `sudo howdy set timeout 20` |
 | Frame is a white blob | IR illuminator overexposure at close range | back off to 40–60 cm, or tune `exposure` |
 | Frame is all black | illuminator not lit / not settled | wait 1–2 s; re-check with `howdy snapshot` |
-| `Configured camera device does not exist` | `/dev/videoN` numbering changed | switch to `/dev/v4l/by-id/` |
+| `Configured camera device does not exist` | `/dev/videoN` numbering changed | install the pin service (`--pin`); do not use by-id |
 | Scores hovering at 0.60 | only one enrolled model | enrol 3–4 more |
 | `howdy test` hangs silently | it is an interactive preview window | use `howdy-compare` + `end_report` |
 | `pamtester` says success but shows nothing | missing `-v` | add `-v` |
 | 1Password still asks for a finger | wrong service — it uses `polkit-1` | edit `/etc/pam.d/polkit-1` |
+| **Face unlock dies after a reboot**, `cannot open configured camera` | the `indexN` in the by-id name re-points at the colour node | run `--pin` to install the pin service; don't use by-id |
+| Face "works" but a photo passes too | same cause — silently running on the colour camera | check that `device_path` really is the IR node |
 | Lid closed now waits for a fingerprint | lid line's `success=N` does not match the module count | set N to the number of modules you inserted |
 | The whole lock screen vanished | QML capital-case property / load failure | `journalctl --user \| grep "plugin load failed"` |
 
@@ -614,8 +676,12 @@ field, the SDDM password field, and the `sudo` prompt all stay usable.
 ## 11. Maintenance checklist
 
 ```bash
-# 1. is the camera node still there (numbering can change across reboots)
-v4l2-ctl -d /dev/v4l/by-id/usb-SunplusIT_Inc_FJ_Camera_01.00.00-video-index0 --info | grep 'Card type'
+# 1. which node is IR, and is howdy pointing at it (the first suspect after a reboot)
+for d in /sys/class/video4linux/video*; do
+  [[ $(cat $d/name) == *"IR Camera"* && $(cat $d/index) == 0 ]] && echo "IR capture: /dev/$(basename $d)"
+done
+sudo sed -n 's/^device_path = //p' /etc/howdy/config.ini
+systemctl is-enabled u9311-ir-camera-pin.service
 
 # 2. can howdy still run (the single most reliable check — read the exit code)
 sudo /usr/lib/howdy/howdy-compare murgo; echo "exit=$?"

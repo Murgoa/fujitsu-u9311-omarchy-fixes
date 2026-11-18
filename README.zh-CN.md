@@ -13,6 +13,7 @@
 | 4 | **以为这台机器没有红外摄像头**，只能上可见光人脸 | 同一个 UVC 设备注册了 4 个 video 节点，`lsusb` 只显示 1 个；`/dev/video2` 的 `Card type` 才是 `IR Camera` | [docs/face-unlock-howdy.zh-CN.md §1](docs/face-unlock-howdy.zh-CN.md#1-识别硬件那个被-lsusb-藏起来的-ir-节点) |
 | 5 | **人脸认证总是 `Face verification timed out`，且无任何日志** | howdy-next 给比对子进程的 `RLIMIT_CPU` 是 `timeout + 5s`，默认 4s 只给 9 秒 CPU，IR 推理打满后被 `SIGXCPU` 杀掉，PAM 层却报成「超时」 | [docs/face-unlock-howdy.zh-CN.md §4](docs/face-unlock-howdy.zh-CN.md#4-最坑的一个face-verification-timed-out-其实是-cpu-超限) |
 | 6 | **1Password 解锁只弹指纹，改成优先人脸无效** | 1Password 的「系统认证」走 polkit，不是它自己的 PAM；要改 `/etc/pam.d/polkit-1` | [docs/face-unlock-howdy.zh-CN.md §7.4](docs/face-unlock-howdy.zh-CN.md#74-polkit--1password-就在这里) |
+| 7 | **人脸解锁装好后过一天就失效**，日志 `cannot open configured camera` | `/dev/v4l/by-id/...-video-index0` 的 `indexN` 是 sysfs `index` 值不是节点号，彩色与 IR 都报 `index=0`，重启后链接从 IR 漂到彩色节点 | [docs/face-unlock-howdy.zh-CN.md §1](docs/face-unlock-howdy.zh-CN.md#别用-by-id也别硬编码-devvideon) |
 
 ---
 

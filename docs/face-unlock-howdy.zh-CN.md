@@ -29,6 +29,10 @@
    开 `end_report` 后直接跑 `/usr/lib/howdy/howdy-compare <user>`。
 6. **1Password 的验证走 polkit，不是它自己的 PAM。** 想让 1Password 优先人脸，
    改 `/etc/pam.d/polkit-1`，改 1Password 设置没有任何用。
+7. **别把 `/dev/v4l/by-id/...-video-index0` 当成稳定路径。** 名字里的 `indexN` 是 sysfs
+   `index` 的值，不是节点号；这颗摄像头彩色和 IR 两个传感器都报 `index=0`，所以重启后
+   这个链接会从 IR 节点漂到彩色节点，人脸直接 `cannot open configured camera`。
+   **本机真人踩过这个坑。** 必须按 sysfs `name` + `index` 认设备，并开机重新 pin（§1）。
 
 ---
 
@@ -82,9 +86,12 @@ ffmpeg -f v4l2 -video_size 640x360 -input_format gray \
 一张打印照片、甚至手机屏幕上的一张照片都可能通过。IR 图像只反映主动补光下的反射率，
 照片在那个波段是黑的。这是 Windows Hello 用 IR 的原因，也是这里唯一的正确选择。
 
-### 用稳定路径，不要写 `/dev/videoN`
+### 别用 `by-id`，也别硬编码 `/dev/videoN`
 
-节点编号会随枚举顺序变化。用 `by-id`：
+这一节是本篇里**最重要的纠正**。第一版文档推荐了 `/dev/v4l/by-id/`，那是错的，
+而且错得很隐蔽——它会工作，直到某次重启。
+
+`by-id` 的链接名长这样：
 
 ```bash
 $ ls -la /dev/v4l/by-id/
@@ -92,17 +99,67 @@ usb-SunplusIT_Inc_FJ_Camera_01.00.00-video-index0 -> ../../video2
 usb-SunplusIT_Inc_FJ_Camera_01.00.00-video-index1 -> ../../video3
 ```
 
-注意厂商字符串是 **SunplusIT**（`lsusb` 报的是 Chicony，两者都对，一个是 USB 描述符
-里的 iManufacturer，一个是 idVendor 的厂商库名）。
-
-确认 `index0` 到底指向哪个节点：
+看起来 `index0` 就是「第 0 个采集节点」，稳定可靠。**但名字里的 `indexN` 不是节点号，
+而是 sysfs 里 `index` 文件的值**：
 
 ```bash
-$ v4l2-ctl -d /dev/v4l/by-id/usb-SunplusIT_Inc_FJ_Camera_01.00.00-video-index0 --info | grep 'Card type'
-    Card type        : FJ Camera: IR Camera
+$ for f in /sys/class/video4linux/video*/index; do echo "$f = $(cat $f)"; done
+/sys/class/video4linux/video0/index = 0     # 彩色采集
+/sys/class/video4linux/video1/index = 1     # 彩色元数据
+/sys/class/video4linux/video2/index = 0     # IR 采集   ← 和 video0 撞了
+/sys/class/video4linux/video3/index = 1     # IR 元数据
 ```
 
-（本机 `index0` → `video2` 是 IR，`index1` → `video3`。**不同机器可能相反，自己查。**）
+**这颗摄像头有两个传感器（彩色 + IR），两个都报 `index=0`。** 于是
+`...-video-index0` 到底指向谁是枚举顺序说了算。本机实测：
+
+| | `...-video-index0` 指向 | 结果 |
+|---|---|---|
+| 装完当天 | `video2`（IR） | 正常，8/8 通过 |
+| **重启一次后** | **`video0`（彩色）** | `Failed to open camera device` |
+
+第一次重启后人脸就废了，日志是：
+
+```
+pam_howdy(sudo:auth): Face verification failed: cannot open configured camera
+```
+
+更糟的情况是：如果彩色节点恰好能打开，人脸会**静默地改用彩色摄像头**——功能看起来
+正常，但已经失去了 IR 防照片的性质，而这正是当初选 IR 的全部理由。
+
+### 正确做法：按 sysfs 的 name + index 认设备，并且开机重新认一次
+
+```bash
+for d in /sys/class/video4linux/video*; do
+  [[ $(cat "$d/name") == *"IR Camera"* && $(cat "$d/index") == 0 ]] \
+    && echo "/dev/$(basename "$d")"
+done
+# → /dev/video2
+```
+
+`name` 是驱动上报的字符串，`index` 区分采集口和元数据口，两者组合唯一且不随枚举顺序变。
+但 `/dev/videoN` 这个**编号**本身还是会变，所以不能写死——要开机重新写一遍 config。
+`scripts/u9311-face-unlock-setup.sh --pin` 会安装一个 systemd oneshot + 一条 udev 规则来做这件事：
+
+```bash
+# 核心逻辑，装成 /usr/local/bin/u9311-ir-camera-pin
+ir=""
+for d in /sys/class/video4linux/video*; do
+  [[ $(cat "$d/name") == *"IR Camera"* ]] || continue
+  [[ $(cat "$d/index") == 0 ]] || continue
+  ir="/dev/$(basename "$d")"; break
+done
+[[ $(sed -n 's/^device_path = //p' /etc/howdy/config.ini) == "$ir" ]] || howdy set device_path "$ir"
+```
+
+udev 规则让摄像头在 resume / 重新枚举时也触发一次：
+
+```
+ACTION=="add", SUBSYSTEM=="video4linux", ATTR{name}=="*IR Camera*", TAG+="systemd", ENV{SYSTEMD_WANTS}+="u9311-ir-camera-pin.service"
+```
+
+> 顺带一个观察：厂商字符串是 **SunplusIT**（`lsusb` 报的是 Chicony，两者都对，
+> 一个是 USB 描述符里的 `iManufacturer`，一个是 `idVendor` 的厂商库名）。
 
 ---
 
@@ -158,7 +215,8 @@ abort_if_lid_closed = false    # 合盖外接屏也要能解锁
 disabled = false
 
 [video]
-device_path = /dev/v4l/by-id/usb-SunplusIT_Inc_FJ_Camera_01.00.00-video-index0
+device_path = /dev/video2        # 由 pin 服务维护，别硬编码 —— 见 §1
+                                 # (en) maintained by the pin service
 timeout = 20                   # ← 关键，见 §4
 max_height = 320               # 降分辨率换速度，320 已足够 YuNet
 frame_width = 640
@@ -562,11 +620,13 @@ WARN qml: service plugin load failed for murgo.lock:
 | `Face verification timed out` 且无输出 | **CPU 超限被 `SIGXCPU` 杀**（退出码 152） | `sudo howdy set timeout 20` |
 | 画面全白一片 | IR 补光灯近距离过曝 | 拉开到 40–60 cm；或调 `exposure` |
 | 画面全黑 | IR 灯未亮 / 未稳定 | 等 1–2 秒；`howdy snapshot` 复核 |
-| `Configured camera device does not exist` | `/dev/videoN` 编号变了 | 改用 `/dev/v4l/by-id/` |
+| `Configured camera device does not exist` | `/dev/videoN` 编号变了 | 装 pin 服务（`--pin`），别用 by-id |
 | 得分在 0.60 上下徘徊 | 只注册了 1 个模型 | 再录 3–4 个 |
 | `howdy test` 挂着不动、无输出 | 它是交互预览窗口 | 改用 `howdy-compare` + `end_report` |
 | `pamtester` 说成功但看不到提示 | 忘了 `-v` | 加 `-v` |
 | 1Password 还在验指纹 | 改错服务了，它走 `polkit-1` | 改 `/etc/pam.d/polkit-1` |
+| **重启后人脸失效**，`cannot open configured camera` | `by-id` 的 `indexN` 指向了彩色节点 | 跑 `--pin` 装 pin 服务，别用 by-id |
+| 人脸"能用"但照片也能过 | 同上，静默跑在彩色摄像头上 | 看 `device_path` 是否真的是 IR 节点 |
 | 合盖后反而等指纹 | lid 那行 `success=N` 与模块数不匹配 | 插了 N 个模块就把 N 改成对应值 |
 | 锁屏整个消失了 | QML 属性名大写 / 加载失败 | `journalctl --user \| grep "plugin load failed"` |
 
@@ -595,8 +655,12 @@ pamtester -v omarchy-lock-face murgo authenticate </dev/null
 ## 11. 维护清单
 
 ```bash
-# 1. 摄像头节点还在吗（重启后编号可能变）
-v4l2-ctl -d /dev/v4l/by-id/usb-SunplusIT_Inc_FJ_Camera_01.00.00-video-index0 --info | grep 'Card type'
+# 1. IR 节点是哪个，以及 howdy 是否指对了（这才是重启后的第一嫌疑）
+for d in /sys/class/video4linux/video*; do
+  [[ $(cat $d/name) == *"IR Camera"* && $(cat $d/index) == 0 ]] && echo "IR capture: /dev/$(basename $d)"
+done
+sudo sed -n 's/^device_path = //p' /etc/howdy/config.ini
+systemctl is-enabled u9311-ir-camera-pin.service
 
 # 2. howdy 还能跑吗（最可靠的单一检查，看退出码）
 sudo /usr/lib/howdy/howdy-compare murgo; echo "exit=$?"
