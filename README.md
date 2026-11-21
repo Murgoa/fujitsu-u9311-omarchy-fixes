@@ -368,6 +368,22 @@ one is a complete rollback for the ACPI change — no extra kernel installation 
 > Keeping an *older* kernel as a "rollback" is **not** equivalent: its module tree may be gone
 > after a package update.
 
+## Related issue on the same machine: battery drains while plugged in
+
+If your U9311 ever wakes from suspend and then runs the battery flat **even though the
+USB-C charger is connected**, that is a second, unrelated firmware defect (TCSS xHCI fails to
+resume in S3, and USB-PD negotiation is never re-established). It ends in a protective
+hibernate, which looks like a hard hang — no ping, no SSH.
+
+Full write-up and fix: [docs/tcss-pd-power-loss.md](docs/tcss-pd-power-loss.md)
+
+Quick check after a resume:
+
+```bash
+sudo journalctl -b -k | grep "xHC error in resume"
+cat /sys/class/power_supply/AC/online      # 0 while the cable is plugged in
+```
+
 ### References
 
 - ArchWiki — Fujitsu Lifebook U9311: <https://wiki.archlinux.org/title/Fujitsu_Lifebook_U9311>

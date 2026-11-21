@@ -1,0 +1,20 @@
+# Install to: /etc/udev/rules.d/99-u9311-tcss-power.rules
+#
+# Fujitsu U9311: keep the Thunderbolt 4 / Type-C subsystem (TCSS) xHCI in D0.
+#
+# Rationale: when 0000:00:0d.0 sits in D3 before the system enters S3, resume
+# fails with:
+#     xhci_hcd 0000:00:0d.0: xHC error in resume, USBSTS 0x401, Reinit
+# and USB Power Delivery negotiation is not restored, so the machine keeps
+# running on battery even though the USB-C charger is connected.
+#
+# Forcing D0 avoids that transition. Cost is ~0.2-0.5 W while idling; during S3
+# the platform is powered down anyway, so there is no extra cost there.
+#
+# Apply:
+#     sudo udevadm control --reload-rules
+#     sudo udevadm trigger --action=change --sysname-match="0000:00:0d.0"
+#
+# See docs/tcss-pd-power-loss.md
+
+ACTION=="add|change", SUBSYSTEM=="pci", KERNEL=="0000:00:0d.0", ATTR{power/control}="on"
